@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
@@ -22,8 +23,16 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
     http_timeout_seconds: float = 60.0
 
+    # Finished videos land here as <task_id>.mp4 beside a <task_id>.json record.
+    # The JSON doubles as the task store's on-disk state, so a restart mid-render
+    # doesn't orphan a clip you already paid for.
+    output_dir: Path = Path("outputs")
+
+    # Only used to show an approximate KRW figure next to the USD estimate.
+    usd_krw_rate: float = 1400.0
+
     # --- Prompt enhancer (LLM) ---
-    llm_provider: Literal["openai", "gemini"] = "openai"
+    llm_provider: Literal["openai", "gemini"] = "gemini"
 
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"

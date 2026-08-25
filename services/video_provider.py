@@ -29,6 +29,11 @@ class VideoProvider(Protocol):
     # True when the finished video sits behind an API key and therefore has to
     # be streamed through this backend instead of handed straight to a browser.
     requires_auth_download: bool
+    # USD per second of output, when the provider publishes a flat rate, and the
+    # clip length used when the caller doesn't pick one. Both feed the cost
+    # estimate the UI shows before you spend anything; None means "unknown".
+    price_per_second: float | None
+    default_duration_seconds: int | None
 
     async def submit(
         self,
@@ -64,6 +69,24 @@ async def _stream_bytes(
         raise UpstreamError(f"{provider} download failed: {exc}") from exc
 
 
+# Veo 3.1 list prices in USD per second of output, by model tier and
+# resolution. Lite does not offer 4k. Source: the Gemini API pricing page.
+_VEO_PRICE_USD_PER_SECOND: dict[str, dict[str, float]] = {
+    "lite": {"720p": 0.05, "1080p": 0.08},
+    "fast": {"720p": 0.10, "1080p": 0.12, "4k": 0.30},
+    "standard": {"720p": 0.40, "1080p": 0.40, "4k": 0.60},
+}
+
+
+def _veo_tier(model: str) -> str:
+    name = model.lower()
+    if "lite" in name:
+        return "lite"
+    if "fast" in name:
+        return "fast"
+    return "standard"
+
+
 # Replicate prediction states -> our public vocabulary.
 _STATUS_MAP: dict[str, TaskStatus] = {
     "starting": "PENDING",
@@ -79,6 +102,10 @@ class ReplicateVideoProvider:
 
     name = "replicate"
     requires_auth_download = False  # replicate.delivery URLs are public
+    # Replicate bills per second of GPU time, which varies by model and load,
+    # so there is no flat rate to quote up front.
+    price_per_second = None
+    default_duration_seconds = None
 
     def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
         self._settings = settings
@@ -213,6 +240,10 @@ class GeminiVeoVideoProvider:
     # Veo accepts only these clip lengths.
     _ALLOWED_DURATIONS = (4, 6, 8)
 
+    # What Veo renders when `durationSeconds` is omitted — the priciest of the
+    # three, which is why the UI picks a length explicitly.
+    default_duration_seconds = 8
+
     def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
         self._settings = settings
         self._client = client
@@ -220,6 +251,23 @@ class GeminiVeoVideoProvider:
 
     def is_configured(self) -> bool:
         return bool(self._settings.gemini_api_key)
+
+    @property
+    def price_per_second(self) -> float | None:
+        """Published Veo 3.1 rate for this model + resolution, in USD.
+
+        https://ai.google.dev/gemini-api/docs/pricing — a local table rather
+        than a lookup call, so it needs updating if Google changes prices.
+        """
+        tier = _veo_tier(self.model)
+        resolution = self._settings.veo_resolution.strip().lower()
+        return _VEO_PRICE_USD_PER_SECOND.get(tier, {}).get(resolution)
+
+    def estimate_cost_usd(self, duration_seconds: int | None) -> float | None:
+        rate = self.price_per_second
+        if rate is None:
+            return None
+        return round(rate * (duration_seconds or self.default_duration_seconds), 4)
 
     @property
     def _headers(self) -> dict[str, str]:

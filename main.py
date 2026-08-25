@@ -15,7 +15,12 @@ from typing import Annotated
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
 from config import Settings, get_settings
@@ -48,22 +53,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     client = httpx.AsyncClient(timeout=httpx.Timeout(settings.http_timeout_seconds))
 
+    # Reload what the last process left behind before anything else, so a render
+    # that survived a restart is picked back up instead of being paid for twice.
+    store = TaskStore(persist_dir=settings.output_dir)
+    restored = store.load()
+
+    video_service = VideoService(
+        provider=build_video_provider(settings, client),
+        store=store,
+        output_dir=settings.output_dir,
+    )
+
     app.state.settings = settings
     app.state.http_client = client
     app.state.enhancer = build_prompt_enhancer(settings, client)
-    app.state.video_service = VideoService(
-        provider=build_video_provider(settings, client),
-        store=TaskStore(),
-    )
+    app.state.video_service = video_service
 
     logger.info(
         "Started with llm_provider=%s video_provider=%s",
         settings.llm_provider,
-        app.state.video_service.provider.name,
+        video_service.provider.name,
     )
+    if restored:
+        resumed = video_service.resume_interrupted()
+        logger.info("Restored %d task(s) from disk, resumed %d", restored, resumed)
+
     try:
         yield
     finally:
+        await video_service.shutdown()
         await client.aclose()
 
 
@@ -128,6 +146,11 @@ async def health(
         video_provider=videos.provider.name,
         video_configured=videos.provider.is_configured(),
         video_model=getattr(videos.provider, "model", None),
+        price_per_second_usd=getattr(videos.provider, "price_per_second", None),
+        default_duration_seconds=getattr(
+            videos.provider, "default_duration_seconds", None
+        ),
+        usd_krw_rate=settings.usd_krw_rate,
     )
 
 
@@ -166,7 +189,11 @@ async def generate_video(
     if payload.enhance:
         prompt = await enhancer.enhance(prompt)
 
-    task = await videos.create_task(prompt)
+    task = await videos.create_task(
+        prompt,
+        duration_seconds=payload.duration_seconds,
+        aspect_ratio=payload.aspect_ratio,
+    )
     background_tasks.add_task(
         videos.submit_task,
         task.task_id,
@@ -174,7 +201,10 @@ async def generate_video(
         aspect_ratio=payload.aspect_ratio,
     )
     return GenerateVideoResponse(
-        task_id=task.task_id, status=task.status, prompt=task.prompt
+        task_id=task.task_id,
+        status=task.status,
+        prompt=task.prompt,
+        estimated_cost_usd=task.estimated_cost_usd,
     )
 
 
@@ -190,10 +220,11 @@ async def get_task(
 ) -> TaskStatusResponse:
     task = await videos.get_task(task_id)
 
-    # Providers whose output sits behind an API key are served through our own
-    # proxy route, so the client never needs the credential.
+    # Point at our own route when the provider's output needs an API key, and
+    # also whenever we hold a local copy — that one still plays after the
+    # provider has expired the original.
     video_url = task.video_url
-    if video_url and videos.provider.requires_auth_download:
+    if video_url and (videos.provider.requires_auth_download or task.local_path):
         video_url = str(request.url_for("download_video", task_id=task_id))
 
     return TaskStatusResponse(
@@ -201,6 +232,8 @@ async def get_task(
         status=task.status,
         prompt=task.prompt,
         video_url=video_url,
+        local_path=task.local_path,
+        estimated_cost_usd=task.estimated_cost_usd,
         error=task.error,
         created_at=task.created_at,
         updated_at=task.updated_at,
@@ -218,15 +251,23 @@ async def get_task(
         409: {"model": ErrorResponse, "description": "Task is not COMPLETED yet"},
     },
 )
-async def download_video(task_id: str, videos: VideoServiceDep) -> StreamingResponse:
+async def download_video(task_id: str, videos: VideoServiceDep) -> Response:
     task = await videos.get_task(task_id)
     if task.status != "COMPLETED" or not task.video_url:
         raise TaskNotReadyError(f"Task {task_id} is {task.status}, not COMPLETED.")
 
+    headers = {"Content-Disposition": f'inline; filename="{task_id}.mp4"'}
+
+    # Prefer the saved copy: it supports range requests (so the player can seek)
+    # and keeps working once the provider has deleted the original.
+    local = videos.local_video_path(task)
+    if local is not None:
+        return FileResponse(local, media_type="video/mp4", headers=headers)
+
     return StreamingResponse(
         videos.stream_video(task.video_url),
         media_type="video/mp4",
-        headers={"Content-Disposition": f'inline; filename="{task_id}.mp4"'},
+        headers=headers,
     )
 
 

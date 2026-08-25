@@ -62,6 +62,9 @@ class GenerateVideoResponse(BaseModel):
     task_id: str
     status: TaskStatus = "PENDING"
     prompt: str
+    estimated_cost_usd: float | None = Field(
+        default=None, description="List price for this render, if the provider quotes one."
+    )
 
 
 class TaskStatusResponse(BaseModel):
@@ -69,6 +72,11 @@ class TaskStatusResponse(BaseModel):
     status: TaskStatus
     prompt: str
     video_url: str | None = None
+    local_path: str | None = Field(
+        default=None,
+        description="Where the finished mp4 was saved on the server, once downloaded.",
+    )
+    estimated_cost_usd: float | None = None
     error: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -81,6 +89,13 @@ class HealthResponse(BaseModel):
     video_provider: str
     video_configured: bool
     video_model: str | None = None
+    price_per_second_usd: float | None = Field(
+        default=None, description="Published rate for the selected model/resolution."
+    )
+    default_duration_seconds: int | None = Field(
+        default=None, description="Clip length used when the caller doesn't pick one."
+    )
+    usd_krw_rate: float = Field(description="Rate used for the approximate KRW figure.")
 
 
 class ErrorResponse(BaseModel):

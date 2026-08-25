@@ -29,6 +29,45 @@ app. Only the selected provider's key is required.
 > the Gemini free tier; a free key enhances prompts fine but fails at
 > `/api/generate-video` with a quota error.
 
+## Cost
+
+Every render is billed per second of output, so the UI shows the price before
+you click. At the default `veo-3.1-lite-generate-preview` / `720p`:
+
+| Length | Cost | ≈ KRW |
+| ------ | ------ | ----- |
+| 4s     | $0.20  | 280원 |
+| 6s     | $0.30  | 420원 |
+| 8s     | $0.40  | 560원 |
+
+The length dropdown defaults to **6s**. Leaving it on *모델 기본값* sends no
+length at all and Veo renders 8s, the priciest of the three. Other tiers, per
+second at 720p: `fast` $0.10, full `veo-3.1-generate-preview` $0.40 — the same
+8s clip costs $3.20 there. Rates live in `_VEO_PRICE_USD_PER_SECOND`
+(`services/video_provider.py`) and come from the
+[Gemini API pricing page](https://ai.google.dev/gemini-api/docs/pricing); update
+them there if Google changes them. `USD_KRW_RATE` only affects the KRW figure.
+
+## Where the videos go
+
+**Veo deletes generated videos after two days.** So the backend downloads each
+finished clip to `OUTPUT_DIR` (default `outputs/`) the moment it completes:
+
+```
+outputs/
+  6f1c….mp4     the video
+  6f1c….json    prompt, length, cost, timestamps — and the task's own state
+```
+
+The download is driven by a server-side watcher, not by the browser, so closing
+the tab mid-render doesn't cost you the clip. That JSON is also the task store's
+on-disk state: it's read back at startup, so a restart during a render resumes
+the job instead of orphaning something you already paid for. Once a local copy
+exists, `/api/tasks/{id}/video` serves it — which keeps working after Veo has
+expired the original.
+
+`outputs/` is gitignored.
+
 ## Setup
 
 ```bash
@@ -97,11 +136,21 @@ keys — the UI shows a banner when one is missing.
 
 Set `"enhance": true` to run the enhancer first and skip the separate call.
 `duration_seconds` / `aspect_ratio` are forwarded only when supplied — Veo
-accepts durations of 4, 6, or 8 seconds and is rejected early otherwise, while
-Replicate input keys differ per model, so check the model's schema there.
+accepts durations of 4, 6, or 8 seconds only, while Replicate input keys differ
+per model, so check the model's schema there.
+
+> Any other length passes schema validation (which allows 1–60) and is rejected
+> by the provider check inside the background task, so you get a `202` and then
+> a `FAILED` on the next poll rather than a `422`. Nothing is billed. See
+> *Known rough edges*.
 
 ```json
-{ "task_id": "6f1c...", "status": "PENDING", "prompt": "..." }
+{
+  "task_id": "6f1c...",
+  "status": "PENDING",
+  "prompt": "...",
+  "estimated_cost_usd": 0.3
+}
 ```
 
 Returns immediately; the render is submitted in a background task.
@@ -115,7 +164,9 @@ Refreshes from the provider on every call while the task is in flight.
   "task_id": "6f1c...",
   "status": "COMPLETED",
   "prompt": "...",
-  "video_url": "https://replicate.delivery/.../out.mp4",
+  "video_url": "http://127.0.0.1:8000/api/tasks/6f1c.../video",
+  "local_path": "outputs/6f1c....mp4",
+  "estimated_cost_usd": 0.3,
   "error": null,
   "created_at": "2026-08-25T10:00:00Z",
   "updated_at": "2026-08-25T10:01:12Z"
@@ -132,8 +183,9 @@ uses `video_url` — it never sees a credential.
 
 ### `GET /api/tasks/{task_id}/video`
 
-Streams the finished MP4 through the backend (Veo only; Replicate links are
-already public). `409` if the task isn't `COMPLETED` yet.
+Serves the finished MP4. Prefers the saved local copy — which supports range
+requests, so the player can seek, and outlives the provider's own link — and
+falls back to streaming from the provider. `409` if the task isn't `COMPLETED`.
 
 Errors use `{"detail": "..."}`: `404` unknown task, `409` video not ready,
 `422` invalid body, `502` upstream provider error, `503` missing API key.
@@ -156,16 +208,17 @@ static/index.html             The whole frontend (Tailwind CDN + vanilla JS)
 services/
   prompt_enhancer.py          OpenAI + Gemini backends behind one protocol
   video_provider.py           Veo + Replicate backends, submit/fetch/stream
-  video_service.py            Task lifecycle orchestration
-  task_store.py               In-memory task registry
+  video_service.py            Task lifecycle, completion watcher, auto-save
+  task_store.py               Task registry, mirrored to outputs/*.json
   errors.py                   Service exceptions → HTTP status codes
+outputs/                      Saved videos + task state (gitignored)
 ```
 
 ## Production notes
 
-- **Task storage is in-memory.** Tasks vanish on restart and aren't shared
-  between workers — run a single worker, or swap `TaskStore` for a Redis-backed
-  class with the same coroutines.
+- **Task storage is a directory of JSON files.** Fine for one process; it isn't
+  shared between workers and every update rewrites a file. Run a single worker,
+  or swap `TaskStore` for a Redis/Postgres class with the same coroutines.
 - **Polling costs a request per call.** Replicate supports webhooks; for high
   traffic, add a `webhook` field in `ReplicateVideoProvider.submit()` and a
   receiving route that updates the store directly.
@@ -175,3 +228,22 @@ services/
   console warning and needs network access. For a real deployment, build a
   stylesheet with the Tailwind CLI and swap the `<script>` tag for a `<link>`.
 - Add rate limiting on `/api/generate-video` — every call spends provider credit.
+
+## Known rough edges
+
+Not bugs that cost money, but worth knowing:
+
+- **Veo length validation happens late.** `duration_seconds` is checked against
+  `(4, 6, 8)` in `GeminiVeoVideoProvider.submit()`, which runs in the background
+  task — so a bad value returns `202` and fails on the next poll instead of
+  `422`. Nothing is billed, since the check precedes the upstream call. Moving
+  it into the route would need a provider-aware validator, because Replicate
+  accepts other lengths.
+- **`CORS_ORIGINS=["*"]` with `allow_credentials=True` is a combination browsers
+  reject.** Harmless while the UI is served from this origin — no preflight is
+  ever made — but it will silently not work if you host the frontend separately.
+  Set a concrete origin list before you do.
+- **Nothing stops repeat clicks.** There is no confirmation and no rate limit;
+  each `영상 생성` press spends real credit.
+- **The UI has no gallery.** Past renders are on disk under `outputs/` but the
+  page only ever shows the current one.
